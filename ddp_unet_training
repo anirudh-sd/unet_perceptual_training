@@ -1,0 +1,491 @@
+import os
+import argparse
+import random
+import numpy as np
+import time
+from PIL import Image
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, DistributedSampler
+import torchvision.transforms as transforms
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from dataloader import MarineSnowDataset
+from loss_functions import *
+from unet_model import UNet
+import wandb
+import logging
+from warnings import filterwarnings
+filterwarnings("ignore")
+
+
+# def reduce_item(item, world_size, device):
+#     """
+#     Reduce a scalar item across all processes and return the averaged result.
+    
+#     Args:
+#         item (float or int): The scalar value to reduce.
+#         world_size (int): Number of processes participating in the reduction.
+#         device (torch.device): The device on which to perform the reduction.
+        
+#     Returns:
+#         float: The averaged result after reduction.
+#     """
+#     tensor = torch.tensor(item, dtype=torch.float32, device=device)
+#     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+#     tensor /= world_size
+#     return tensor.item()
+
+def sum_item(item, device):
+    """
+    Sum a scalar item across all processes and return the total result.
+    
+    Args:
+        item (float or int): The scalar value to sum.
+        device (torch.device): The device on which to perform the reduction.
+        
+    Returns:
+        float: The total sum after reduction.
+    """
+    tensor = torch.tensor(item, dtype=torch.float32, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor.item()
+
+def display_image_and_output(net, dataset, index, device):
+
+    net.eval()
+    marine_snow_image, background_image, _ = dataset[index]
+    marine_snow_image = marine_snow_image.unsqueeze(0).to(device)
+    background_image = background_image.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        output = net(marine_snow_image)
+
+    # Denormalize images
+    mean = torch.tensor([0.1759, 0.2191, 0.2369]).view(1, 3, 1, 1).to(device)
+    std = torch.tensor([0.1865, 0.1994, 0.1893]).view(1, 3, 1, 1).to(device)
+
+    output_image = output * std + mean
+    input_image = marine_snow_image * std + mean
+    target_image = background_image * std + mean
+
+    output_image = torch.clamp(output_image, 0.0, 1.0)
+    input_image = torch.clamp(input_image, 0.0, 1.0)
+    target_image = torch.clamp(target_image, 0.0, 1.0)
+
+    # Convert to PIL Images
+    output_image_pil = transforms.ToPILImage()(output_image.squeeze(0).cpu())
+    input_image_pil = transforms.ToPILImage()(input_image.squeeze(0).cpu())
+    target_image_pil = transforms.ToPILImage()(target_image.squeeze(0).cpu())
+
+    # Combine images side by side
+    combined_width =  input_image_pil.width + output_image_pil.width + target_image_pil.width
+    combined_image = Image.new('RGB', (combined_width, input_image_pil.height))
+    combined_image.paste(input_image_pil, (0, 0))
+    combined_image.paste(output_image_pil, (input_image_pil.width, 0))
+    combined_image.paste(target_image_pil, (input_image_pil.width + output_image_pil.width, 0))
+
+    return combined_image
+
+def check_and_load_model(model,exp_name, device, optimizer=None, scheduler=None):
+    os.makedirs(exp_name, exist_ok=True)
+    model_files = [f for f in os.listdir(exp_name) if f.startswith('model_epoch_') and f.endswith('.pth')]
+    if model_files:
+        # There are saved models, get the latest one
+        model_epochs = [int(f.replace('model_epoch_', '').replace('.pth', '')) for f in model_files]
+        start_epoch = max(model_epochs)
+        latest_model_file = f"model_epoch_{start_epoch}.pth"
+        checkpoint_path = os.path.join(exp_name, latest_model_file)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded model from {checkpoint_path}")
+        resume_training = True
+        
+        if optimizer and scheduler:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        return model, start_epoch, resume_training
+    else:
+        os.makedirs(exp_name, exist_ok=True)
+        print("No model found")
+        return model, 0, False
+
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--wandb_project', help='WandB project name', type=str, default='marine-snow-removal-unet-perceptual')
+    parser.add_argument('--lr_step_size', help='Step size for LR scheduler', default=50, type=int)
+    parser.add_argument('--background_dir', help='Directory containing background images', default='data/gt', type=str)
+    parser.add_argument('--marine_snow_dir', help='Directory containing marine snow images', default='data/input', type=str)
+    parser.add_argument('--lr_gamma', help='Gamma for LR scheduler', default=0.1, type=float)
+    parser.add_argument('--num_workers', help='Number of workers for DataLoader', default=4, type=int)
+    parser.add_argument('--learning_rate', type=float, default=2e-5, help='Learning rate for optimizer')
+    parser.add_argument('--crop_size', type=int, nargs=2, default=[512, 512], help='Crop size for input images')
+    parser.add_argument('--train_batch_size', type=int, default=4, help='Batch size for training')
+    parser.add_argument('--alpha', type=float, default=0.5, help='Weight for perceptual loss in total loss')
+    parser.add_argument('--val_batch_size', type=int, default=4, help='Batch size for validation')
+    parser.add_argument('--exp_name', type=str, default='exp1', help='Experiment name')
+    parser.add_argument('--num_epochs', type=int, default=100, help='Number of epochs for training')
+    parser.add_argument('--seed', type=int, default=19, help='Random seed')
+
+    args = parser.parse_args()
+
+    lr_step_size = args.lr_step_size
+    lr_gamma = args.lr_gamma
+    learning_rate = args.learning_rate
+    crop_size =args.crop_size 
+    train_batch_size = args.train_batch_size
+    alpha = args.alpha
+    val_batch_size = args.val_batch_size
+    exp_name = args.exp_name
+    num_epochs = args.num_epochs
+    seed =args.seed
+    background_dir = args.background_dir
+    marine_snow_dir = args.marine_snow_dir
+    num_workers = args.num_workers
+
+    if not os.path.isdir(background_dir):
+        raise FileNotFoundError(f"Background directory {background_dir} does not exist.")
+
+    if not os.path.isdir(marine_snow_dir):
+        raise FileNotFoundError(f"Marine snow directory {marine_snow_dir} does not exist.")
+
+    # Initialize the process group
+    local_rank = int(os.environ["LOCAL_RANK"])
+    dist.init_process_group(backend='nccl', init_method='env://')
+
+
+
+    # Set the device for this process
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+
+    # Get the rank and world size
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+
+    # Set random seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    if rank == 0:
+        for arg in vars(args):
+            print(f'{arg}: {getattr(args, arg)}')
+
+
+
+
+
+    # Load the model (without optimizer and scheduler yet)
+    net = UNet(in_channels=3, out_channels=3)
+    net, start_epoch, resume_training = check_and_load_model(net,exp_name, device)
+
+    end_epoch = num_epochs - start_epoch
+
+    # Define optimizer and scheduler before loading their states
+    optimizer = optim.Adam(net.parameters(), lr=learning_rate)
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_step_size, gamma=lr_gamma)
+
+    # Reload optimizer and scheduler states if resuming
+    if resume_training:
+        checkpoint_path = os.path.join(exp_name, f'model_epoch_{start_epoch}.pth')
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    # Move model to the device
+    net = net.to(device)
+
+    # Wrap the model with DistributedDataParallel
+    net = torch.nn.parallel.DistributedDataParallel(net, device_ids=[local_rank], output_device=local_rank)
+
+
+
+    # Initialize wandb and configure logging
+    if rank == 0:
+        wandb.init(project='marine-snow-removal', name=exp_name)
+        logging.basicConfig(
+            level=logging.INFO,
+            format='[%(asctime)s] %(message)s',
+            handlers=[
+                logging.FileHandler(f'{exp_name}/{exp_name}.log'),
+                logging.StreamHandler()
+            ]
+        )
+        # Log hyperparameters
+        wandb.config.update({
+            'learning_rate': learning_rate,
+            'crop_size': crop_size,
+            'train_batch_size': train_batch_size,
+            'alpha': alpha,
+            'val_batch_size': val_batch_size,
+            'num_epochs': num_epochs,
+            'seed': seed,
+        })
+        
+        #
+        #  watch the model
+        wandb.watch(net.module, log='all')
+    else:
+      # For other ranks, set logging level to WARNING
+      logging.basicConfig(level=logging.WARNING)
+    
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Resize(crop_size),  # Resize the image
+        transforms.Lambda(lambda x: torch.clamp(x, 0.0, 1.0)),
+        transforms.Normalize(mean=[0.1759, 0.2191, 0.2369], std=[0.1865, 0.1994, 0.1893]),
+        ])
+
+    dataset = MarineSnowDataset(background_dir, marine_snow_dir, transform)
+
+
+
+    indices = list(range(len(dataset)))
+    train_indices, val_indices = train_test_split(indices, test_size=0.2, random_state=seed)
+
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(dataset, val_indices)
+
+    # Use DistributedSampler
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank)
+
+    # Create DataLoaders with the DistributedSampler
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=train_batch_size, 
+        sampler=train_sampler, 
+        num_workers=num_workers, 
+        pin_memory=True)
+    
+    val_dataloader = DataLoader(
+        val_dataset, 
+        batch_size=val_batch_size, 
+        sampler=val_sampler, 
+        num_workers=num_workers, 
+        pin_memory=True)
+
+    total_train_batches = len(train_dataloader) 
+    total_val_batches = len(val_dataloader) 
+
+
+
+
+    # --- Initialize Feature Extractor for Perceptual Loss --- #
+    feature_extractor = VGGFeatureExtractor().to(device)
+    feature_extractor.eval()
+
+
+
+    # Training loop
+    for epoch in range(start_epoch,end_epoch):
+        train_sampler.set_epoch(epoch)  # Shuffle data differently each epoch
+        if rank == 0:
+            logging.info(f"Epoch {epoch+1} started")
+        train_mse_loss = 0.0
+        train_perceptual_loss = 0.0
+        train_total_loss = 0.0
+        train_psnr =0
+        train_ssim = 0
+
+        # Training
+        net.train()
+
+        for batch in tqdm(train_dataloader, disable=(rank != 0)):
+           
+
+            marine_snow_image, background_image, _ = batch
+            marine_snow_image = marine_snow_image.to(device)
+            background_image = background_image.to(device)
+
+            optimizer.zero_grad()
+
+            # lets gooooo Forward
+            output = net(marine_snow_image)
+            
+            # losses eh, it will be there son
+            batch_mse_loss, batch_perceptual_loss, batch_total_loss = total_loss(
+                output, background_image, feature_extractor, alpha)
+            _, batch_ssim = ssim_loss(output, background_image)
+            batch_psnr = psnr_loss(output, background_image)
+            
+            # Backward pass and optimization
+            loss = batch_total_loss  
+            loss.backward()
+            optimizer.step()
+
+
+
+
+
+            train_mse_loss += batch_mse_loss.item() # detaching tensor
+            train_perceptual_loss += batch_perceptual_loss.item()
+            train_total_loss += batch_total_loss.item()
+            train_ssim += batch_ssim
+            train_psnr += batch_psnr
+
+
+        # # Average the losses across all processes
+        # train_mse_loss = reduce_item(train_mse_loss, world_size, device) / total_train_batches 
+        # train_perceptual_loss = reduce_item(train_perceptual_loss, world_size, device) / total_train_batches
+        # train_total_loss = reduce_item(train_total_loss, world_size, device) / total_train_batches
+        # train_ssim = reduce_item(train_ssim, world_size, device) / total_train_batches
+        # train_psnr = reduce_item(train_psnr, world_size, device) / total_train_batches
+        
+        # Sum the cumulative losses across processes
+        train_mse_loss = sum_item(train_mse_loss, device)
+        train_perceptual_loss = sum_item(train_perceptual_loss, device)
+        train_total_loss = sum_item(train_total_loss, device)
+        train_ssim = sum_item(train_ssim, device)
+        train_psnr = sum_item(train_psnr, device)
+
+        # Compute average losses
+        total_train_batches = len(train_dataloader) * world_size
+        train_mse_loss /= total_train_batches
+        train_perceptual_loss /= total_train_batches
+        train_total_loss /= total_train_batches
+        train_ssim /= total_train_batches
+        train_psnr /= total_train_batches
+
+        # Validation
+        net.eval()
+
+        val_mse_loss = 0.0
+        val_perceptual_loss = 0.0
+        val_total_loss = 0.0
+        val_ssim = 0
+        val_psnr = 0
+
+        with torch.no_grad():
+            for batch in val_dataloader:
+
+                marine_snow_image, background_image, _ = batch
+                marine_snow_image = marine_snow_image.to(device)
+                background_image = background_image.to(device)
+
+                output = net(marine_snow_image)
+
+                batch_mse_loss, batch_perceptual_loss, batch_total_loss = total_loss(
+                    output, background_image, feature_extractor, alpha)
+                _, batch_ssim = ssim_loss(output, background_image)
+                batch_psnr = psnr_loss(output, background_image)
+
+                val_ssim += batch_ssim
+                val_psnr += batch_psnr
+                val_mse_loss += batch_mse_loss.item()
+                val_perceptual_loss += batch_perceptual_loss.item()
+                val_total_loss += batch_total_loss.item()
+
+
+        # val_ssim = reduce_item(val_ssim, world_size, device) / total_val_batches
+        # val_psnr = reduce_item(val_psnr, world_size, device) / total_val_batches
+        # val_mse_loss = reduce_item(val_mse_loss, world_size, device) / total_val_batches
+        # val_perceptual_loss = reduce_item(val_perceptual_loss, world_size, device) / total_val_batches
+        # val_total_loss = reduce_item(val_total_loss, world_size, device) / total_val_batches
+
+        # Sum the cumulative losses across processes
+        val_mse_loss = sum_item(val_mse_loss, device)
+        val_perceptual_loss = sum_item(val_perceptual_loss, device)
+        val_total_loss = sum_item(val_total_loss, device)
+        val_ssim = sum_item(val_ssim, device)
+        val_psnr = sum_item(val_psnr, device)
+
+
+        # Compute average losses
+        total_val_batches = len(val_dataloader) * world_size
+        val_mse_loss /= total_val_batches
+        val_perceptual_loss /= total_val_batches
+        val_total_loss /= total_val_batches
+        val_ssim /= total_val_batches
+        val_psnr /= total_val_batches
+
+
+        scheduler.step()
+
+        # Only rank 0 saves the model and prints logs
+        if rank == 0:
+
+            # Save the model and optimizer states
+            checkpoint_path = os.path.join(exp_name, f'model_epoch_{epoch+1}.pth')
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': net.module.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'loss': train_total_loss,
+                'train_mse_loss': train_mse_loss,
+                'train_perceptual_loss': train_perceptual_loss,
+                'train_total_loss': train_total_loss,
+                'val_mse_loss': val_mse_loss,
+                'val_perceptual_loss': val_perceptual_loss,
+                'val_total_loss': val_total_loss,
+                'val_psnr': val_psnr,
+                'val_ssim': val_ssim
+            }, checkpoint_path)
+
+
+
+            logging.info(f'Epoch {epoch+1}, Loss: {train_total_loss}')
+            logging.info(f'Train MSE Loss: {train_mse_loss}')
+            logging.info(f'Train Perceptual Loss: {train_perceptual_loss}')
+            logging.info(f'Train Total Loss: {train_total_loss}')
+            logging.info(f'Train PSNR: {train_psnr}')
+            logging.info(f'Train SSIM: {train_ssim}')
+            
+
+            logging.info(f'Val MSE Loss: {val_mse_loss}')
+            logging.info(f'Val Perceptual Loss: {val_perceptual_loss}')
+            logging.info(f'Val Total Loss: {val_total_loss}')
+            logging.info(f'Val PSNR: {val_psnr}')
+            logging.info(f'Val SSIM: {val_ssim}')
+
+            # Log images
+            random_index = random.randint(0, len(val_dataset)-1)
+            combined_image = display_image_and_output(net, val_dataset, random_index, device)
+            image_dir = os.path.join(exp_name, 'random_images')
+            os.makedirs(image_dir, exist_ok=True)
+            random_output_image_path = os.path.join(image_dir, f"epoch_{epoch+1}_output.png")
+            combined_image.save(random_output_image_path)
+
+            index = 0 
+            combined_image = display_image_and_output(net, val_dataset, index, device)
+            image_dir = os.path.join(exp_name, 'first_image')
+            os.makedirs(image_dir, exist_ok=True)
+            first_output_image_path = os.path.join(image_dir, f"epoch_{epoch+1}_output.png")
+            combined_image.save(first_output_image_path)
+
+            # Log results and images to wandb
+            wandb.log({
+                'epoch': epoch+1,
+                'train_mse_loss': train_mse_loss,
+                'train_perceptual_loss': train_perceptual_loss,
+                'train_total_loss': train_total_loss,
+                'train_psnr': train_psnr,
+                'train_ssim': train_ssim,
+                'val_mse_loss': val_mse_loss,
+                'val_perceptual_loss': val_perceptual_loss,
+                'val_total_loss': val_total_loss,
+                'val_psnr': val_psnr,
+                'val_ssim': val_ssim,
+                'output_image': wandb.Image(random_output_image_path),
+                'first_output_image': wandb.Image(first_output_image_path),
+                'learning_rate': optimizer.param_groups[0]['lr']
+            })
+
+
+    # Clean up
+    dist.barrier()
+    dist.destroy_process_group()
+
+if __name__ == '__main__':
+    main()
